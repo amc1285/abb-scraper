@@ -1,47 +1,45 @@
 name: AudioBook Bay Scraper
 
 on:
-  # Run automatically on a schedule (every Sunday at 6am UTC)
   schedule:
     - cron: "0 6 * * 0"
 
-  # Also lets you run it manually from the GitHub website anytime
   workflow_dispatch:
     inputs:
       max_pages:
-        description: "How many pages to scrape (1 page = ~9 books). Use 500 for full scrape."
+        description: "Pages to scrape (each page = ~9 books, site has ~500 pages)"
         required: false
-        default: "50"
+        default: "10"
+      scrape_details:
+        description: "Visit each book page for full metadata? (true/false)"
+        required: false
+        default: "true"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Download your repo's code onto the GitHub server
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Install Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Step 3: Install the Python libraries the scraper needs
       - name: Install dependencies
         run: pip install requests beautifulsoup4 openpyxl
 
-      # Step 4: Run the scraper
       - name: Run scraper
         env:
-          MAX_PAGES: ${{ github.event.inputs.max_pages || '50' }}
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '10' }}
+          SCRAPE_DETAILS: ${{ github.event.inputs.scrape_details || 'true' }}
           DELAY_MIN: "2.0"
           DELAY_MAX: "4.0"
         run: python scraper.py
 
-      # Step 5: Upload the Excel file so you can download it
-      - name: Upload spreadsheet as artifact
+      - name: Upload spreadsheet
         uses: actions/upload-artifact@v4
         with:
           name: audiobook-spreadsheet
