@@ -8,6 +8,7 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime
 import os
 import re
+import sys
 
 BASE_URL = "https://audiobookbay.lu"
 HEADERS = {
@@ -21,23 +22,50 @@ HEADERS = {
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
 DELAY_MIN = float(os.environ.get("DELAY_MIN", "2.0"))
 DELAY_MAX = float(os.environ.get("DELAY_MAX", "4.0"))
-# Whether to visit each book's detail page for full metadata
-# Set to "false" in env to skip (faster but fewer fields)
 SCRAPE_DETAILS = os.environ.get("SCRAPE_DETAILS", "true").lower() == "true"
 
 
 def get_page(url, retries=3):
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp = requests.get(url, headers=HEADERS, timeout=30)
             resp.raise_for_status()
+            print(f"  [OK] {url} (status {resp.status_code}, {len(resp.text)} chars)")
             return resp.text
         except Exception as e:
-            print(f"  Attempt {attempt+1} failed: {e}")
+            print(f"  Attempt {attempt+1} failed for {url}: {e}")
             if attempt < retries - 1:
                 time.sleep(random.uniform(3, 6))
     print(f"  [FAILED] {url}")
     return None
+
+
+def debug_html_structure(html, page_num):
+    """Print diagnostic info about what selectors exist on the page."""
+    soup = BeautifulSoup(html, "html.parser")
+    print(f"\n  --- DEBUG: Page {page_num} structure ---")
+    print(f"  Title tag: {soup.title.string if soup.title else 'NONE'}")
+    print(f"  div.post count: {len(soup.select('div.post'))}")
+    print(f"  article count: {len(soup.select('article'))}")
+    print(f"  .postWrapper count: {len(soup.select('.postWrapper'))}")
+    print(f"  div.postContent count: {len(soup.select('div.postContent'))}")
+    print(f"  div.post-content count: {len(soup.select('div.post-content'))}")
+    print(f"  h2 tags total: {len(soup.select('h2'))}")
+    print(f"  h2 a[href] count: {len(soup.select('h2 a[href]'))}")
+    # Show all unique class names on divs to find the right container
+    div_classes = set()
+    for div in soup.select("div[class]"):
+        for c in div.get("class", []):
+            div_classes.add(c)
+    # Filter to likely post containers
+    likely = [c for c in div_classes if any(x in c.lower() for x in
+              ["post", "book", "entry", "item", "card", "content", "article", "listing"])]
+    print(f"  Likely container classes: {sorted(likely)}")
+    # Show first h2 text to confirm we're on the right page
+    h2s = soup.select("h2")
+    for h2 in h2s[:3]:
+        print(f"  Sample h2: {h2.get_text(strip=True)[:80]}")
+    print(f"  --- END DEBUG ---\n")
 
 
 def parse_detail_page(html, url):
@@ -46,31 +74,23 @@ def parse_detail_page(html, url):
     data = {}
 
     try:
-        # The detail page has a div with class "postContent" or similar
-        # We'll scrape all visible text and look for known patterns
         full_text = soup.get_text("\n")
 
-        # Categories — look for "Category:" anywhere on the page
         cat_match = re.search(r'Category:\s*(.+)', full_text)
         data["Categories"] = cat_match.group(1).strip() if cat_match else ""
 
-        # Keywords
         kw_match = re.search(r'(?:Keywords?|Tags?):\s*(.+)', full_text)
         data["Keywords"] = kw_match.group(1).strip() if kw_match else ""
 
-        # Language
         lang_match = re.search(r'Language:\s*(.+)', full_text)
         data["Language"] = lang_match.group(1).strip() if lang_match else ""
 
-        # Format
         fmt_match = re.search(r'Format:\s*([^\n/]+)', full_text)
         data["Format"] = fmt_match.group(1).strip() if fmt_match else ""
 
-        # Bitrate
         br_match = re.search(r'Bitrate:\s*([^\n]+)', full_text)
         data["Bitrate"] = br_match.group(1).strip() if br_match else ""
 
-        # File size
         fs_match = re.search(r'File\s*Size:\s*([^\n]+)', full_text)
         data["File Size"] = fs_match.group(1).strip() if fs_match else ""
 
@@ -80,54 +100,63 @@ def parse_detail_page(html, url):
     return data
 
 
-def parse_listing_page(html):
+def parse_listing_page(html, page_num=0):
     """Parse a listing page and return list of basic book dicts."""
     soup = BeautifulSoup(html, "html.parser")
     books = []
 
-    # Try multiple possible container selectors
-    posts = soup.select("div.post") or soup.select("article") or soup.select(".postWrapper")
+    # Run debug on first page so we can see what's there
+    if page_num <= 1:
+        debug_html_structure(html, page_num)
 
+    # ── Strategy 1: standard div.post ──────────────────────────────
+    posts = soup.select("div.post")
+
+    # ── Strategy 2: article tags ────────────────────────────────────
     if not posts:
-        # Fallback: find all h2 links that look like book titles
-        for h2 in soup.select("h2 a[href*='/abss/']"):
-            full_title = h2.get_text(strip=True)
-            url = h2.get("href", "")
+        posts = soup.select("article")
+
+    # ── Strategy 3: common wrapper class names ──────────────────────
+    if not posts:
+        for selector in [".postWrapper", ".post-wrapper", ".entry", ".book-item",
+                         ".listing-item", ".audiobook", "div.postContent",
+                         "div.post-content", ".content-post"]:
+            posts = soup.select(selector)
+            if posts:
+                print(f"  Found posts via selector: {selector}")
+                break
+
+    # ── Strategy 4: any div containing an /abss/ link ───────────────
+    if not posts:
+        print("  Trying strategy 4: divs containing /abss/ links")
+        abss_links = soup.select("a[href*='/abss/']")
+        print(f"  Found {len(abss_links)} /abss/ links on page")
+        seen_urls = set()
+        for a in abss_links:
+            url = a.get("href", "")
             if not url.startswith("http"):
                 url = BASE_URL + url
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
 
-            if " - " in full_title:
-                parts = full_title.rsplit(" - ", 1)
-                title, author = parts[0].strip(), parts[1].strip()
-            else:
-                title, author = full_title, ""
+            full_title = a.get_text(strip=True)
+            if not full_title:
+                continue
 
-            # Try to find date near this element
-            parent = h2.find_parent()
-            date_posted = ""
-            if parent:
-                text = parent.get_text()
-                date_match = re.search(r'Posted:\s*(\d+\s+\w+\s+\d{4})', text)
-                if date_match:
-                    date_posted = date_match.group(1).strip()
+            # Walk up to find the nearest useful parent container
+            parent = a.find_parent("div") or a.find_parent()
+            post_text = parent.get_text("\n") if parent else ""
 
-            books.append({
-                "Title": title,
-                "Author": author,
-                "URL": url,
-                "Categories": "",
-                "Keywords": "",
-                "Language": "",
-                "Format": "",
-                "Bitrate": "",
-                "File Size": "",
-                "Date Posted": date_posted,
-            })
+            books.append(_extract_book(full_title, url, post_text))
+
         return books
 
+    # ── Parse found posts ────────────────────────────────────────────
+    print(f"  Found {len(posts)} post containers")
     for post in posts:
         try:
-            title_tag = post.select_one("h2 a") or post.select_one("h1 a")
+            title_tag = post.select_one("h2 a") or post.select_one("h1 a") or post.select_one("a[href*='/abss/']")
             if not title_tag:
                 continue
 
@@ -136,63 +165,9 @@ def parse_listing_page(html):
             if url and not url.startswith("http"):
                 url = BASE_URL + url
 
-            if " - " in full_title:
-                parts = full_title.rsplit(" - ", 1)
-                title, author = parts[0].strip(), parts[1].strip()
-            else:
-                title, author = full_title, ""
-
-            # Extract all text from this post for regex parsing
             post_text = post.get_text("\n")
+            books.append(_extract_book(full_title, url, post_text))
 
-            categories = ""
-            keywords = ""
-            language = ""
-            format_ = ""
-            bitrate = ""
-            file_size = ""
-            date_posted = ""
-
-            for line in post_text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("Category:"):
-                    categories = line.replace("Category:", "").strip()
-                elif re.match(r'Keywords?:', line):
-                    keywords = re.sub(r'^Keywords?:\s*', '', line).strip()
-                elif line.startswith("Language:"):
-                    language = line.replace("Language:", "").strip()
-                elif line.startswith("Format:"):
-                    parts = line.split("/")
-                    format_ = parts[0].replace("Format:", "").strip()
-                    if len(parts) > 1 and "Bitrate:" in parts[1]:
-                        bitrate = parts[1].replace("Bitrate:", "").strip()
-                elif line.startswith("Bitrate:") and not bitrate:
-                    bitrate = line.replace("Bitrate:", "").strip()
-                elif re.match(r'File\s*Size:', line):
-                    file_size = re.sub(r'File\s*Size:\s*', '', line).strip()
-                elif line.startswith("Posted:"):
-                    date_posted = line.replace("Posted:", "").strip()
-
-            # Fallback date from regex
-            if not date_posted:
-                dm = re.search(r'Posted:\s*(\d+\s+\w+\s+\d{4})', post_text)
-                if dm:
-                    date_posted = dm.group(1).strip()
-
-            books.append({
-                "Title": title,
-                "Author": author,
-                "URL": url,
-                "Categories": categories,
-                "Keywords": keywords,
-                "Language": language,
-                "Format": format_,
-                "Bitrate": bitrate,
-                "File Size": file_size,
-                "Date Posted": date_posted,
-            })
         except Exception as e:
             print(f"  [PARSE ERROR] {e}")
             continue
@@ -200,23 +175,62 @@ def parse_listing_page(html):
     return books
 
 
+def _extract_book(full_title, url, post_text):
+    """Extract a book dict from a title, url, and surrounding text."""
+    # Split title — author usually after last " - "
+    if " - " in full_title:
+        parts = full_title.rsplit(" - ", 1)
+        title, author = parts[0].strip(), parts[1].strip()
+    else:
+        title, author = full_title, ""
+
+    categories = keywords = language = format_ = bitrate = file_size = date_posted = ""
+
+    for line in post_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("Category:"):
+            categories = line.replace("Category:", "").strip()
+        elif re.match(r'Keywords?:', line):
+            keywords = re.sub(r'^Keywords?:\s*', '', line).strip()
+        elif line.startswith("Language:"):
+            language = line.replace("Language:", "").strip()
+        elif line.startswith("Format:"):
+            parts = line.split("/")
+            format_ = parts[0].replace("Format:", "").strip()
+            if len(parts) > 1 and "Bitrate:" in parts[1]:
+                bitrate = parts[1].replace("Bitrate:", "").strip()
+        elif line.startswith("Bitrate:") and not bitrate:
+            bitrate = line.replace("Bitrate:", "").strip()
+        elif re.match(r'File\s*Size:', line):
+            file_size = re.sub(r'File\s*Size:\s*', '', line).strip()
+        elif line.startswith("Posted:"):
+            date_posted = line.replace("Posted:", "").strip()
+
+    if not date_posted:
+        dm = re.search(r'Posted:\s*(\d+\s+\w+\s+\d{4})', post_text)
+        if dm:
+            date_posted = dm.group(1).strip()
+
+    return {
+        "Title": title,
+        "Author": author,
+        "URL": url,
+        "Categories": categories,
+        "Keywords": keywords,
+        "Language": language,
+        "Format": format_,
+        "Bitrate": bitrate,
+        "File Size": file_size,
+        "Date Posted": date_posted,
+    }
+
+
 def get_total_pages(html):
     soup = BeautifulSoup(html, "html.parser")
     max_page = 1
-
-    # Try pagination div first
-    for a in soup.select("a[href*='/page/']"):
-        try:
-            href = a.get("href", "")
-            num = int(href.rstrip("/").split("/page/")[-1].rstrip("/"))
-            if num > max_page:
-                max_page = num
-        except:
-            pass
-
-    # Also check for »» last page link
-    last_links = soup.select("a")
-    for a in last_links:
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
         if "/page/" in href:
             try:
@@ -225,7 +239,6 @@ def get_total_pages(html):
                     max_page = num
             except:
                 pass
-
     print(f"  Detected {max_page} total pages on site")
     return max_page
 
@@ -283,16 +296,17 @@ def save_xlsx(books, filename):
     ws2["B5"] = MAX_PAGES if MAX_PAGES else "All"
     ws2.column_dimensions["A"].width = 22
     ws2.column_dimensions["B"].width = 25
+
     wb.save(filename)
     print(f"Saved {len(books)} books to {filename}")
 
 
 def scrape():
-    print(f"Fetching page 1...")
+    print(f"Fetching page 1: {BASE_URL}/")
     first_html = get_page(f"{BASE_URL}/")
     if not first_html:
         print("Could not reach site. Exiting.")
-        return []
+        sys.exit(1)  # Exit with error code so GitHub Actions marks the job as failed
 
     total_pages = get_total_pages(first_html)
     end_page = min(total_pages, MAX_PAGES) if MAX_PAGES else total_pages
@@ -310,11 +324,10 @@ def scrape():
                 print(f"  Skipping page {page}")
                 continue
 
-        books = parse_listing_page(html)
+        books = parse_listing_page(html, page_num=page)
 
-        # If detail scraping is enabled, visit each book page for full metadata
         if SCRAPE_DETAILS and books:
-            for i, book in enumerate(books):
+            for book in books:
                 if book["URL"] and not book.get("Categories"):
                     detail_html = get_page(book["URL"])
                     if detail_html:
@@ -344,5 +357,15 @@ if __name__ == "__main__":
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"output/audiobookbay_{timestamp}.xlsx"
         save_xlsx(books, filename)
+        print(f"Done. File: {filename}")
     else:
-        print("No books scraped.")
+        print("No books scraped — check the DEBUG output above for HTML structure info.")
+        # Save a dummy file so the artifact upload doesn't fail with a misleading error
+        os.makedirs("output", exist_ok=True)
+        filename = f"output/audiobookbay_{datetime.now().strftime('%Y%m%d_%H%M')}_EMPTY.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "No books scraped — check Actions log for DEBUG output"
+        wb.save(filename)
+        print(f"Saved empty placeholder to {filename}")
+        sys.exit(1)
